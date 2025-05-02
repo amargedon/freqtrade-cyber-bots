@@ -38,7 +38,7 @@ class DCAStrategy(BaseStrategy):
     # Check the documentation or the Sample strategy to get the latest version.
     INTERFACE_VERSION = 3
 
-    STRATEGY_VERSION_DCA = '1.11.0'
+    STRATEGY_VERSION_DCA = '1.12.0'
 
     # Max number of safety orders (-1 means disabled)
     max_entry_position_adjustment = -1
@@ -72,13 +72,15 @@ class DCAStrategy(BaseStrategy):
     trailing_safety_order_configuration = {}
     #trailing_safety_order_configuration['default'] = {}
     #trailing_safety_order_configuration['default'][0] = {}
-    #trailing_safety_order_configuration['default'][0]['start_percentage'] = 0.25
+    #trailing_safety_order_configuration['default'][0]['start-percentage'] = 0.25
     #trailing_safety_order_configuration['default'][0]['factor'] = 0.50
 
-    # Settings controlling when to send notification about the trailing safety orders
+    # Settings controlling when to send notification about trailing safety orders and profit increase
     notify_trailing_start = True
     notify_trailing_update = True
     notify_trailing_reset = True
+    notify_stoploss_update = True
+    notify_profit_update = True
 
     # Profit configuration. 
     # First try to use the configuration for the pair and direction, then try 'default'. If none of them are 
@@ -87,9 +89,9 @@ class DCAStrategy(BaseStrategy):
     #profit_configuration['default'] = {}
     #profit_configuration['default'][0] = {}
     #profit_configuration['default'][0]['activation-percentage'] = 2.25
-    #self.profit_configuration['default'][0]['min-order-threshold-sell'] = 1
-    #self.profit_configuration['default'][0]['min-order-threshold-stoploss'] = 1
-    #self.profit_configuration['default'][0]['min-order-threshold-profit'] = 1
+    #profit_configuration['default'][0]['min-order-threshold-sell'] = 1
+    #profit_configuration['default'][0]['min-order-threshold-stoploss'] = 1
+    #profit_configuration['default'][0]['min-order-threshold-profit'] = 1
     #profit_configuration['default'][0]['sell-percentage'] = 50.00
     #profit_configuration['default'][0]['stoploss-initial'] = 0.50
     #profit_configuration['default'][0]['stoploss-increment-factor'] = 0.25
@@ -130,6 +132,12 @@ class DCAStrategy(BaseStrategy):
         if 'notify_trailing_reset' in config:
             if isinstance(config['notify_trailing_reset'], bool):
                 self.notify_trailing_reset = config['notify_trailing_reset']
+        if 'notify_stoploss_update' in config:
+            if isinstance(config['notify_stoploss_update'], bool):
+                self.notify_stoploss_update = config['notify_stoploss_update']
+        if 'notify_profit_update' in config:
+            if isinstance(config['notify_profit_update'], bool):
+                self.notify_profit_update = config['notify_profit_update']
 
         if 'safety_order_mode' in config:
             if config['safety_order_mode'] in ('shift', 'merge'):
@@ -220,12 +228,17 @@ class DCAStrategy(BaseStrategy):
         # Process Profit configuration...
         for pairkey in self.profit_configuration:
             for l in pairvalue.keys():
-                # Check if there is any stoploss configured. If so, make sure we can process it by enabling the functioncall
+                # Check if there is any stoploss and profit factor configured.
+                # If so, make sure we can process it by enabling the function callback
                 stoploss = self.profit_configuration[pairkey][l]['stoploss-initial']
-                if stoploss > 0.0:
+                if not self.use_custom_stoploss and stoploss > 0.0:
                     self.log(f"Enabling custom stoploss because of profit configuration!")
                     self.use_custom_stoploss = True
-                    break
+
+                tpfactor = self.profit_configuration[pairkey][l]['profit-increment-factor']
+                if not self.use_exit_signal and tpfactor > 0.0:
+                    self.log(f"Enabling custom exit because of profit configuration!")
+                    self.use_exit_signal = True
 
 
     def bot_start(self, **kwargs) -> None:
@@ -326,7 +339,23 @@ class DCAStrategy(BaseStrategy):
                             level="WARNING"
                         )
 
+            # Check pressence of roi table
+            trade_roi_tbl = opentrade.get_custom_data(key='roi_table')
+            if trade_roi_tbl is None:
+                trade_roi_tbl = self.get_initial_roi_table(opentrade.pair, opentrade.trade_direction)
+                opentrade.set_custom_data(key='roi_table', value=trade_roi_tbl)
+                self.log(f"{opentrade.pair}: added initial roi table")
+
+            # Check pressence of sell table
+            trade_sell_tbl = opentrade.get_custom_data(key='sell_table')
+            if trade_sell_tbl is None:
+                trade_sell_tbl = self.get_initial_sell_table(opentrade.pair, opentrade.trade_direction)
+                opentrade.set_custom_data(key='sell_table', value=trade_sell_tbl)
+                self.log(f"{opentrade.pair}: added initial sell table")
+
             self.log(f"{opentrade.pair}: dca table = '{trade_dca_tbl}'")
+            self.log(f"{opentrade.pair}: roi table = '{trade_roi_tbl}'")
+            self.log(f"{opentrade.pair}: sell table = '{trade_sell_tbl}'")
 
             custompairkey = self.get_custom_pairkey(opentrade.pair, opentrade.trade_direction)
             self.initialize_custom_data(custompairkey)
@@ -497,22 +526,95 @@ class DCAStrategy(BaseStrategy):
                     f"{trade.pair}: profit increased from {self.custom_info[custompairkey]['last_profit_percentage']:.2f}% "
                     f"to {current_profit_percentage:.2f}%. Updating stoploss to {stoploss_percentage:.2f}% ({new_stoploss:.2f}%) based on "
                     f"initial SL {sl_percentage:.2f}% and factor {sl_factor:.2f}%",
-                    notify=False
+                    notify=self.notify_stoploss_update
                 )
 
                 self.custom_info[custompairkey]['last_profit_percentage'] = current_profit_percentage
 
-                # Convert to ratio instead of percentage for framework
+                # Convert to ratio instead of percentage for Freqtrade framework
                 new_stoploss /= 100.0
             else:
                 self.log(
                     f"{trade.pair}: profit {current_profit_percentage:.2f} below {self.custom_info[custompairkey]['last_profit_percentage']:.2f}% "
                     f"not changing the stoploss percentage."
                 )
-        #elif self.custom_info[custompairkey]['last_profit_percentage'] != 0.0:
-        #    self.custom_info[custompairkey]['last_profit_percentage'] = float(0.0)
 
         return new_stoploss
+
+
+    def custom_exit(self, pair: str, trade: Trade, current_time: datetime, 
+                    current_rate: float, current_profit: float, **kwargs
+                    ) -> str | bool | None:
+        """
+        Custom exit signal logic indicating that specified position should be sold. Returning a
+        string or True from this method is equal to setting exit signal on a candle at specified
+        time. This method is not called when exit signal is set.
+
+        This method should be overridden to create exit signals that depend on trade parameters. For
+        example you could implement an exit relative to the candle when the trade was opened,
+        or a custom 1:2 risk-reward ROI.
+
+        Custom exit reason max length is 64. Exceeding characters will be removed.
+
+        :param pair: Pair that's currently analyzed
+        :param trade: trade object.
+        :param current_time: datetime object, containing the current datetime
+        :param current_rate: Rate, calculated based on pricing settings in exit_pricing.
+        :param current_profit: Current profit (as ratio), calculated based on current_rate.
+        :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
+        :return: To execute exit, return a string with custom exit reason or True. Otherwise return
+        None or False.
+        """
+
+        # Create pairkey, or use 'default' 
+        custompairkey, configpairkey = self.get_pairkeys(trade.pair, trade.trade_direction, 'Profit')
+
+        # Get Profit values from config
+        current_profit_percentage = current_profit * 100.0
+        tp_enabled, activation_percentage, tp_factor, tp_min_orders = self.get_profit_config(current_profit_percentage, configpairkey)
+
+        # Check if TP and ROI requires update based on profit increase and config
+        if tp_enabled and trade.nr_of_successful_entries >= tp_min_orders:
+            last_profit_percentage = self.custom_info[custompairkey]['last_profit_percentage']
+            if current_profit_percentage > last_profit_percentage:
+                # Calculate shift percentage based on the config, last and current profit
+                shift_percentage = 0.0
+                if last_profit_percentage > 0.0:
+                    shift_percentage = (current_profit_percentage - last_profit_percentage) * tp_factor
+                else:
+                    shift_percentage = (current_profit_percentage - activation_percentage) * tp_factor
+
+                self.log(
+                    f"{trade.pair}: profit increased from {last_profit_percentage:.2f}% "
+                    f"to {current_profit_percentage:.2f}%. Shift TP with {shift_percentage:.2f}% based on "
+                    f"factor {tp_factor:.2f}%",
+                    notify=self.notify_profit_update
+                )
+
+                trade_roi_tbl = trade.get_custom_data(key='roi_table')
+                self.shift_roi_table(trade_roi_tbl, shift_percentage)
+                trade.set_custom_data(key='roi_table', value=trade_roi_tbl)
+
+                self.custom_info[custompairkey]['last_profit_percentage'] = current_profit_percentage
+            else:
+                self.log(
+                    f"{trade.pair}: profit {current_profit_percentage:.2f} below {last_profit_percentage:.2f}%; "
+                    f"not changing the TP percentage."
+                )
+        elif self.custom_info[custompairkey]['last_profit_percentage'] > 0.0:
+            # Profit below threshold to increase TP levels, restore ROI table as TP was not hit
+            trade_roi_tbl = self.get_initial_roi_table(trade.pair, trade.trade_direction)
+            trade.set_custom_data(key='roi_table', value=trade_roi_tbl)
+
+            self.custom_info[custompairkey]['last_profit_percentage'] = 0.0
+
+            self.log(
+                f"{trade.pair}: profit {current_profit_percentage:.2f}% below configured threshold; reset ROI table.",
+                notify=self.notify_profit_update
+            )
+
+        # Base implementation will handle checking of TP/ROI reached
+        return super().custom_exit(pair, trade, current_time, current_rate, current_profit)
 
 
     def order_filled(self, pair: str, trade: Trade, order: Order, current_time: datetime, **kwargs) -> None:
@@ -534,11 +636,19 @@ class DCAStrategy(BaseStrategy):
             # Get number of entry orders
             count_of_entries = trade.nr_of_successful_entries
             if count_of_entries == 1:
-                # Base order filled, add DCA table
+                # Base order filled, add DCA and ROI table
                 dca_tbl = self.get_initial_dca_table(trade.pair, trade.trade_direction)
                 trade.set_custom_data(key='dca_table', value=dca_tbl)
 
+                roi_tbl = self.get_initial_roi_table(trade.pair, trade.trade_direction)
+                trade.set_custom_data(key='roi_table', value=roi_tbl)
+
+                sell_tbl = self.get_initial_sell_table(trade.pair, trade.trade_direction)
+                trade.set_custom_data(key='sell_table', value=sell_tbl)
+
                 self.log(f"Initial DCA table added to trade: {dca_tbl}")
+                self.log(f"Initial ROI table added to trade: {roi_tbl}")
+                self.log(f"Initial SELL table added to trade: {sell_tbl}")
 
             openorders = len(self.custom_info[custompairkey]['open_safety_orders'])
             if openorders > 0:
@@ -580,6 +690,20 @@ class DCAStrategy(BaseStrategy):
                     self.log(
                         f"{trade.pair}: Safety Order {count_of_safety_orders} has been bought. "
                         f"There are {openorders} orders left.",
+                        notify=True
+                    )
+        elif order.ft_order_side == trade.exit_side and trade.is_open:
+            # Part of the trade has been sold since trade is still open
+            # Find pending sell and update state
+            sell_table = trade.get_custom_data(key='sell_table')
+
+            for idx, selltrigger in enumerate(sell_table):
+                if selltrigger['state'] is 'pending':
+                    sell_table[idx]['state'] = 'sold'
+                    trade.set_custom_data(key='sell_table', value=sell_table)
+
+                    self.log(
+                        f"{trade.pair}: pending sell has been sold. ",
                         notify=True
                     )
         elif not trade.is_open:
@@ -638,9 +762,9 @@ class DCAStrategy(BaseStrategy):
         if self.is_pair_locked(trade.pair):
             return None
 
-        # Return when Trade is in profit
-        if current_profit >= 0.0:
-            return None
+        # Handle trades in profit
+        if current_exit_profit >= 0.0:
+            return self.handle_trade_profit(trade, current_exit_profit * 100.0, min_stake, max_stake)
 
         # Return when no extra orders are allowed
         if self.max_entry_position_adjustment == -1:
@@ -680,7 +804,6 @@ class DCAStrategy(BaseStrategy):
 
         # Calculate the next Safety Order, if not calculated before. Store the calculated value to save some CPU cycles
         if self.custom_info[custompairkey]['next_safety_order_profit_percentage'] == 0.0:
-            dca_table = trade.get_custom_data(key='dca_table')
             dca_table_deviation = dca_table[count_of_safety_orders]['total_deviation_current']
 
             self.custom_info[custompairkey]['next_safety_order_profit_percentage'] = dca_table_deviation
@@ -698,9 +821,9 @@ class DCAStrategy(BaseStrategy):
         if tso_enabled:
             # Return when profit is above Safety Order percentage keeping start_percentage into account (and reset data when required)
             if current_entry_profit_percentage > (next_safety_order_percentage - tso_start_percentage):
-                if self.custom_info[custompairkey]['last_profit_percentage'] != 0.0:
-                    self.custom_info[custompairkey]['last_profit_percentage'] = float(0.0)
-                    self.custom_info[custompairkey]['add_safety_order_on_profit_percentage'] = float(0.0)
+                if self.custom_info[custompairkey]['last_profit_percentage'] < 0.0:
+                    self.custom_info[custompairkey]['last_profit_percentage'] = 0.0
+                    self.custom_info[custompairkey]['add_safety_order_on_profit_percentage'] = 0.0
                     self.custom_info[custompairkey]['trailing_start_datetime'] = datetime.min
 
                     self.log(
@@ -743,7 +866,6 @@ class DCAStrategy(BaseStrategy):
 
         # Oke, time to add a Safety Order!
         # Calculate order(s) to be filled. Can be more than one order when there's been a huge drop
-        dca_table = trade.get_custom_data(key='dca_table')
         orderdata = self.determine_required_safety_orders(dca_table, count_of_safety_orders, current_entry_profit_percentage)
 
         volume = orderdata[0]['volume']
@@ -783,9 +905,44 @@ class DCAStrategy(BaseStrategy):
         """
 
 
-    def handle_trade_profit(self, trade: 'Trade', current_profit: float):
+    def handle_trade_profit(self, trade: 'Trade', current_profit: float, 
+                            min_stake: Optional[float], max_stake: float) -> Optional[float]:
         """
+        Custom trade adjustment logic for trades running into profit, returning the stake amount that a trade should be
+        increased or decreased.
+
+        :param trade: trade object.
+        :param current_profit: Current profit (as percentage)
+        :param min_stake: Minimal stake size allowed by exchange (for both entries and exits)
+        :param max_stake: Maximum stake allowed (either through balance, or by exchange limits).
+        :return float: Stake amount to adjust your trade,
+                       Positive values to increase position, Negative values to decrease position.
+                       Return None for no action.
         """
+
+        sell_table = trade.get_custom_data(key='sell_table')
+
+        for idx, selltrigger in enumerate(sell_table):
+            if current_profit >= selltrigger['tp_percentage'] and selltrigger['state'] is 'waiting':
+                # Profit reached this trigger, update state and trade
+                sell_table[idx]['state'] = 'pending'
+                trade.set_custom_data(key='sell_table', value=sell_table)
+
+                # Calculate the actual amount that should be sold
+                sellamount = trade.stake_amount * (selltrigger['sell_percentage'] / 100.0)
+
+                self.log(
+                    f"{trade.pair}: current profit {current_profit:.4f}% reached sell of {selltrigger['sell_percentage']:.4f}% "
+                    f"which is {sellamount:.4f} amount.",
+                    notify=True
+                )
+
+                return -sellamount, f"Sell {selltrigger['sell_percentage']}% at {selltrigger['tp_percentage']}%"
+            elif current_profit < selltrigger['tp_percentage']:
+                # Since the list is sorted on percentage, we can break the loop if that percentage is not reached yet
+                break
+
+        return None
 
 
     def load_safety_config(self, safety_config: dict) -> None:
@@ -830,7 +987,7 @@ class DCAStrategy(BaseStrategy):
             for index, entry in enumerate(pv):
                 self.trailing_safety_order_configuration[pk][index] = {}
                 for k, v in entry.items():
-                    if k in ('start_percentage', 'factor'):
+                    if k in ('start-percentage', 'factor'):
                         self.trailing_safety_order_configuration[pk][index][k] = v
                         self.log(f"Set trailing order configuration key '{k}' for pair '{pk}' on index '{index}' to value '{v}'")
                     else:
@@ -901,20 +1058,20 @@ class DCAStrategy(BaseStrategy):
 
         # Find percentage and factor to use based on current (negative) profit. Always look one level
         # further to make sure the previous one is the right one to use
-        start_percentage = self.trailing_safety_order_configuration[key][0]['start_percentage']
+        start_percentage = self.trailing_safety_order_configuration[key][0]['start-percentage']
         factor = self.trailing_safety_order_configuration[key][0]['factor']
 
         for l in self.trailing_safety_order_configuration[key].values():
-            if profit_percentage > (safety_order_percentage - l['start_percentage']):
+            if profit_percentage > (safety_order_percentage - l['start-percentage']):
                 break
 
-            start_percentage = l['start_percentage']
+            start_percentage = l['start-percentage']
             factor = l['factor']
 
         return use_trailing, start_percentage, factor
 
 
-    def get_stoploss_config(self, current_profit_percentage, config_pair_key) -> tuple[bool, float, float, float]:
+    def get_stoploss_config(self, current_profit_percentage, config_pair_key) -> tuple[bool, float, float, float, int]:
         """
         Get the stoploss values for the current config based on the pair and profit
 
@@ -938,7 +1095,7 @@ class DCAStrategy(BaseStrategy):
             key = 'default'
         
         if not key:
-            return False, activation_percentage, initial_stoploss, factor
+            return False, activation_percentage, initial_stoploss, factor, order_threshold
 
         # Find percentage and factor to use based on current (positive) profit. Always look one level
         # further to make sure the previous one is the right one to use
@@ -954,22 +1111,23 @@ class DCAStrategy(BaseStrategy):
         return (initial_stoploss > 0.0), activation_percentage, initial_stoploss, factor, order_threshold
 
 
-    def get_profit_config(self, profit_percentage, current_profit_percentage, config_pair_key) -> tuple[bool, float, float]:
+    def get_profit_config(self, current_profit_percentage, config_pair_key) -> tuple[float, float, int]:
         """
         Get the profit values for the current config based on the pair and profit
 
-        :param profit_percentage: Current profit percentage.
-        :param current_profit_percentage: Key to use for looking up data in the configuration.
+        :param current_profit_percentage: Current profit percentage.
         :param config_pair_key: Key to use for looking up data in the configuration.
-        :return tuple[bool, float, float]: If trailing is enabled, the percentage trailing should start on 
+        :return tuple[bool, float, float, float]: If profit is enabled, the percentage trailing should start on 
                                             and the factor to increase the lacking threshold with
         """
 
-        use_trailing = False
+        #use_trailing = False
+        activation_percentage = 0.0
         factor = 0.0
+        order_threshold = 0
 
         # Check which key to use; pair or default. If neither is present, assume the user doesn't
-        # want to use Trailing Safety Order
+        # want to use Trailing Profit
         key = ""
         if config_pair_key in self.profit_configuration:
             key = config_pair_key
@@ -977,23 +1135,24 @@ class DCAStrategy(BaseStrategy):
             key = 'default'
         
         if not key:
-            return use_trailing, profit_percentage, factor
-        else:
-            use_trailing = True
+            return False, activation_percentage, factor, order_threshold
+
+        #if not key:
+        #    return use_trailing, profit_percentage, factor
+        #else:
+        #    use_trailing = True
 
         # Find percentage and factor to use based on current (positive) profit. Always look one level
         # further to make sure the previous one is the right one to use
-        activation_percentage = self.profit_configuration[key][0]['activation_percentage']
-        factor = self.profit_configuration[key][0]['factor']
-
         for l in self.profit_configuration[key].values():
-            if l['activation_percentage'] > current_profit_percentage:
+            if l['activation-percentage'] > current_profit_percentage:
                 break
 
-            activation_percentage = l['activation_percentage']
-            factor = l['factor']
+            activation_percentage = l['activation-percentage']
+            factor = l['profit-increment-factor']
+            order_threshold = l['min-order-threshold-profit']
 
-        return use_trailing, activation_percentage, factor
+        return (activation_percentage > 0.0), activation_percentage, factor, order_threshold
 
 
     def calculate_dca_volume(self, safety_order, config_pair_key, max_safety_orders) -> float:
@@ -1271,3 +1430,56 @@ class DCAStrategy(BaseStrategy):
 
             # Record shift for current order and shift future orders
             safetyorder['total_deviation_current'] += shift_percentage
+
+
+    def get_initial_roi_table(self, pair: str, side: str) -> list:
+        """
+        Get the ROI table applicable for this trade, based on the configuration
+
+        :param pair: Trading pair
+        :param side: Direction of the trade (long/short)
+        :return list: list with ROI levels
+        """
+
+        return self.trade_minimal_roi.copy()
+
+
+    def shift_roi_table(self, roi_table: dict, shift_percentage: float):
+        """
+        Shift the values in the ROI table by the given percentage.
+
+        :param roi_table: ROI table to shift
+        :param shift_percentage: Percentage to shift, will be converted to ratio
+        """
+
+        for time, value in roi_table.items():
+            roi_table[time] = value + (shift_percentage / 100.0)
+
+
+    def get_initial_sell_table(self, pair: str, side: str) -> list:
+        """
+        Get the sell table applicable for this trade, based on the configuration
+
+        :param pair: Trading pair
+        :param side: Direction of the trade (long/short)
+        :return list: list of Sell Orders
+        """
+
+        table = list()
+
+        _, configpairkey = self.get_pairkeys(pair, self.trading_direction, 'Profit')
+
+        if not configpairkey in self.profit_configuration:
+            return table
+
+        for l in self.profit_configuration[configpairkey].values():
+            if 'sell-percentage' in l and l['sell-percentage'] > 0.0:
+                selltrigger = {
+                    'tp_percentage': l['activation-percentage'],
+                    'sell_percentage': l['sell-percentage'],
+                    'state': 'waiting'
+                }
+
+                table.append(selltrigger)
+
+        return table
