@@ -44,7 +44,7 @@ class BaseStrategy(IStrategy):
     # Check the documentation or the Sample strategy to get the latest version.
     INTERFACE_VERSION = 3
 
-    STRATEGY_VERSION_BASE = '1.11.0'
+    STRATEGY_VERSION_BASE = '1.12.0'
 
     # Optimal timeframe for the strategy.
     timeframe = '1h'
@@ -55,7 +55,7 @@ class BaseStrategy(IStrategy):
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
     # Exit trade at profit of 1%
-    minimal_roi = {
+    trade_minimal_roi = {
         "0": 0.01
     }
 
@@ -133,8 +133,8 @@ class BaseStrategy(IStrategy):
         # TODO: improve later on with custom exit with profit and leverage calculation for each pair
         leverage = min(self.leverage_configuration.values()) if len(self.leverage_configuration) > 0 else 1.0
 
-        for k, v in self.minimal_roi.items():
-            self.minimal_roi[k] = round(v * leverage, 4)
+        for k, v in self.trade_minimal_roi.items():
+            self.trade_minimal_roi[k] = round(v * leverage, 4)
 
         self.stoploss *= leverage
 
@@ -369,6 +369,69 @@ class BaseStrategy(IStrategy):
         """
 
         return None
+
+
+    def custom_exit(self, pair: str, trade: Trade, current_time: datetime, 
+                    current_rate: float, current_profit: float, **kwargs
+                    ) -> str | bool | None:
+        """
+        Custom exit signal logic indicating that specified position should be sold. Returning a
+        string or True from this method is equal to setting exit signal on a candle at specified
+        time. This method is not called when exit signal is set.
+
+        This method should be overridden to create exit signals that depend on trade parameters. For
+        example you could implement an exit relative to the candle when the trade was opened,
+        or a custom 1:2 risk-reward ROI.
+
+        Custom exit reason max length is 64. Exceeding characters will be removed.
+
+        :param pair: Pair that's currently analyzed
+        :param trade: trade object.
+        :param current_time: datetime object, containing the current datetime
+        :param current_rate: Rate, calculated based on pricing settings in exit_pricing.
+        :param current_profit: Current profit (as ratio), calculated based on current_rate.
+        :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
+        :return: To execute exit, return a string with custom exit reason or True. Otherwise return
+        None or False.
+        """
+
+        # Skip everything when profit is negative
+        if current_profit < 0.0:
+            return False
+
+        trade_roi_tbl = trade.get_custom_data(key='roi_table')
+
+        if trade_roi_tbl is None:
+            trade_roi_tbl = self.minimal_roi
+
+        # Check if TP is reached based on ROI
+        trade_dur = int((current_time.timestamp() - trade.open_date_utc.timestamp()) // 60)
+
+        # Get required TP
+        roi_entry, roi_tp = self.get_roi_entry(trade_roi_tbl, trade_dur)
+        if roi_tp is None:
+            self.log(
+                f"{trade.pair}: couldnt find required TP for exiting this trade..."
+            )
+            return False
+
+        self.log(
+            f"{trade.pair}: check if current profit {current_profit} > required TP {roi_tp} (entry {roi_entry})."
+        )
+        return current_profit > roi_tp
+
+
+    def get_roi_entry(self, roi_tbl, trade_duration):
+        """
+        """
+
+        # Get highest entry in ROI dict where key <= trade-duration
+        roi_list = [x for x in roi_tbl.keys() if int(x) <= trade_duration]
+        if not roi_list:
+            return None, None
+
+        roi_entry = max(roi_list)
+        return roi_entry, roi_tbl[roi_entry]
 
 
     def create_custom_data(self, pair_key):
