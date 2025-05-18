@@ -566,6 +566,10 @@ class DCAStrategy(BaseStrategy):
         None or False.
         """
 
+        # Base implementation will handle checking of TP/ROI reached
+        if super().custom_exit(pair, trade, current_time, current_rate, current_profit):
+            return True
+
         # Create pairkey, or use 'default' 
         custompairkey, configpairkey = self.get_pairkeys(trade.pair, trade.trade_direction, 'Profit')
 
@@ -584,16 +588,21 @@ class DCAStrategy(BaseStrategy):
                 else:
                     shift_percentage = (current_profit_percentage - activation_percentage) * tp_factor
 
+                trade_roi_tbl = trade.get_custom_data(key='roi_table')
+                trade_dur = int((current_time.timestamp() - trade.open_date_utc.timestamp()) // 60)
+                _, roi_tp_before = self.get_roi_entry(trade_roi_tbl, trade_dur)
+                self.shift_roi_table(trade_roi_tbl, shift_percentage)
+                _, roi_tp_after = self.get_roi_entry(trade_roi_tbl, trade_dur)
+                trade.set_custom_data(key='roi_table', value=trade_roi_tbl)
+
                 self.log(
                     f"{trade.pair}: profit increased from {last_profit_percentage:.2f}% "
-                    f"to {current_profit_percentage:.2f}%. Shift TP with {shift_percentage:.2f}% based on "
-                    f"factor {tp_factor:.2f}%",
+                    f"to {current_profit_percentage:.2f}%. Shifted TP with {shift_percentage:.2f}% "
+                    f"(factor {tp_factor:.2f}%) "
+                    f"from {roi_tp_before:.2f}% to {roi_tp_after:.2f}%",
                     notify=self.notify_profit_update
                 )
 
-                trade_roi_tbl = trade.get_custom_data(key='roi_table')
-                self.shift_roi_table(trade_roi_tbl, shift_percentage)
-                trade.set_custom_data(key='roi_table', value=trade_roi_tbl)
 
                 self.custom_info[custompairkey]['last_profit_percentage'] = current_profit_percentage
             else:
@@ -613,8 +622,8 @@ class DCAStrategy(BaseStrategy):
                 notify=self.notify_profit_update
             )
 
-        # Base implementation will handle checking of TP/ROI reached
-        return super().custom_exit(pair, trade, current_time, current_rate, current_profit)
+        # TP was not reached and possibly only increased or reset
+        return False
 
 
     def order_filled(self, pair: str, trade: Trade, order: Order, current_time: datetime, **kwargs) -> None:
