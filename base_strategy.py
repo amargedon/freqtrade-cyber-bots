@@ -415,9 +415,9 @@ class BaseStrategy(IStrategy):
             )
             return False
 
-        self.log(
-            f"{trade.pair}: check if current profit {current_profit} > required TP {roi_tp} (entry {roi_entry})."
-        )
+        #self.log(
+        #    f"{trade.pair}: check if current profit {current_profit} > required TP {roi_tp} (entry {roi_entry})."
+        #)
         return current_profit > roi_tp
 
 
