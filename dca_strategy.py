@@ -515,7 +515,7 @@ class DCAStrategy(BaseStrategy):
 
         # Calculate new stoploss, when enabled and profit has increased
         if sl_enabled and trade.nr_of_successful_entries >= sl_min_orders:
-            if current_profit_percentage > self.custom_info[custompairkey]['last_profit_percentage']:
+            if current_profit_percentage > self.custom_info[custompairkey]['last_profit_stoploss_percentage']:
                 # Calculate stoploss percentage based on the config and current profit
                 stoploss_percentage = sl_percentage + ((current_profit_percentage - activation_percentage) * sl_factor)
 
@@ -523,19 +523,19 @@ class DCAStrategy(BaseStrategy):
                 new_stoploss = current_profit_percentage - stoploss_percentage
 
                 self.log(
-                    f"{trade.pair}: profit increased from {self.custom_info[custompairkey]['last_profit_percentage']:.2f}% "
+                    f"{trade.pair}: profit increased from {self.custom_info[custompairkey]['last_profit_stoploss_percentage']:.2f}% "
                     f"to {current_profit_percentage:.2f}%. Updating stoploss to {stoploss_percentage:.2f}% ({new_stoploss:.2f}%) based on "
                     f"initial SL {sl_percentage:.2f}% and factor {sl_factor:.2f}%",
                     notify=self.notify_stoploss_update
                 )
 
-                self.custom_info[custompairkey]['last_profit_percentage'] = current_profit_percentage
+                self.custom_info[custompairkey]['last_profit_stoploss_percentage'] = current_profit_percentage
 
                 # Convert to ratio instead of percentage for Freqtrade framework
                 new_stoploss /= 100.0
             else:
                 self.log(
-                    f"{trade.pair}: profit {current_profit_percentage:.2f} below {self.custom_info[custompairkey]['last_profit_percentage']:.2f}% "
+                    f"{trade.pair}: profit {current_profit_percentage:.2f} below {self.custom_info[custompairkey]['last_profit_stoploss_percentage']:.2f}% "
                     f"not changing the stoploss percentage."
                 )
 
@@ -599,7 +599,7 @@ class DCAStrategy(BaseStrategy):
                     f"{trade.pair}: profit increased from {last_profit_percentage:.2f}% "
                     f"to {current_profit_percentage:.2f}%. Shifted TP with {shift_percentage:.2f}% "
                     f"(factor {tp_factor:.2f}%) "
-                    f"from {roi_tp_before:.2f}% to {roi_tp_after:.2f}%",
+                    f"from {roi_tp_before * 100.0:.2f}% to {roi_tp_after * 100.0:.2f}%",
                     notify=self.notify_profit_update
                 )
 
@@ -932,6 +932,11 @@ class DCAStrategy(BaseStrategy):
         sell_table = trade.get_custom_data(key='sell_table')
 
         for idx, selltrigger in enumerate(sell_table):
+            self.log(
+                f"{trade.pair}: examine sell on {selltrigger['sell_percentage']:.4f}% with state {selltrigger['state']} "
+                f"with current profit {current_profit}%..."
+            )
+
             if current_profit >= selltrigger['tp_percentage'] and selltrigger['state'] is 'waiting':
                 # Profit reached this trigger, update state and trade
                 sell_table[idx]['state'] = 'pending'
@@ -1146,11 +1151,6 @@ class DCAStrategy(BaseStrategy):
         if not key:
             return False, activation_percentage, factor, order_threshold
 
-        #if not key:
-        #    return use_trailing, profit_percentage, factor
-        #else:
-        #    use_trailing = True
-
         # Find percentage and factor to use based on current (positive) profit. Always look one level
         # further to make sure the previous one is the right one to use
         for l in self.profit_configuration[key].values():
@@ -1161,7 +1161,7 @@ class DCAStrategy(BaseStrategy):
             factor = l['profit-increment-factor']
             order_threshold = l['min-order-threshold-profit']
 
-        return (activation_percentage > 0.0), activation_percentage, factor, order_threshold
+        return (activation_percentage > 0.0 and factor > 0.0), activation_percentage, factor, order_threshold
 
 
     def calculate_dca_volume(self, safety_order, config_pair_key, max_safety_orders) -> float:
@@ -1337,6 +1337,7 @@ class DCAStrategy(BaseStrategy):
 
         # Insert default data
         self.custom_info[custom_pair_key]['last_profit_percentage'] = float(0.0) # Keep track of profit percentage for every cycle/update
+        self.custom_info[custom_pair_key]['last_profit_stoploss_percentage'] = float(0.0) # Keep track of profit percentage for stoploss for every cycle/update
         self.custom_info[custom_pair_key]['next_safety_order_profit_percentage'] = float(0.0) # Percentage on which the next SO is configured
         self.custom_info[custom_pair_key]['add_safety_order_on_profit_percentage'] = float(0.0) # Percentage on which the next SO should be bought, based on trailing
         self.custom_info[custom_pair_key]['trailing_start_datetime'] = datetime.min # Datetime trailing started
